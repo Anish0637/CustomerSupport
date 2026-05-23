@@ -782,4 +782,124 @@ TOKEN=$(aws cognito-idp initiate-auth \
 
 ---
 
+## Lab 5: Evaluating Agent Quality
+
+### 5.1 Add Online Evaluation Config
+
+```bash
+cd /Users/anishkumar/CustomerSupport
+export AWS_PROFILE=anish0637 && export AWS_DEFAULT_REGION=us-east-1
+
+agentcore add online-eval \
+  --name QualityMonitor \
+  --runtime CustomerSupport \
+  --evaluator Builtin.GoalSuccessRate Builtin.Correctness Builtin.ToolSelectionAccuracy \
+  --sampling-rate 100 \
+  --enable-on-create
+```
+
+> `--sampling-rate 100` evaluates every interaction. Use 10–20% in production to balance cost and coverage.
+
+### 5.2 Deploy
+
+```bash
+agentcore deploy -y -v
+
+# Check status — if QualityMonitor shows DISABLED, enable it:
+agentcore status
+agentcore resume online-eval QualityMonitor
+```
+
+### 5.3 Get Token (if expired)
+
+```bash
+export AWS_PROFILE=anish0637 && export AWS_DEFAULT_REGION=us-east-1
+COGNITO_WEB_CLIENT_ID=4hqbuvfji23kgdeqqn2cujs5p4
+
+TOKEN=$(aws cognito-idp initiate-auth \
+  --auth-flow USER_PASSWORD_AUTH \
+  --client-id $COGNITO_WEB_CLIENT_ID \
+  --auth-parameters USERNAME=workshopuser@example.com,PASSWORD='WorkshopPass1!' \
+  --query 'AuthenticationResult.AccessToken' --output text)
+```
+
+### 5.4 Generate Test Interactions
+
+```bash
+cd /Users/anishkumar/CustomerSupport
+SESSION_EVAL=$(python3 -c 'import uuid; print(uuid.uuid4())')
+
+/Users/anishkumar/.nvm/versions/node/v24.5.0/bin/agentcore invoke \
+  "What can you tell me about the Smart Watch? What's the price and warranty?" \
+  --session-id $SESSION_EVAL --bearer-token "$TOKEN" --stream
+
+/Users/anishkumar/.nvm/versions/node/v24.5.0/bin/agentcore invoke \
+  "I bought headphones last week but they're not working. What's the return policy for audio products?" \
+  --session-id $SESSION_EVAL --bearer-token "$TOKEN" --stream
+
+/Users/anishkumar/.nvm/versions/node/v24.5.0/bin/agentcore invoke \
+  "Check the warranty status for product PROD-001" \
+  --session-id $SESSION_EVAL --bearer-token "$TOKEN" --stream
+
+/Users/anishkumar/.nvm/versions/node/v24.5.0/bin/agentcore invoke \
+  "I want to return my USB-C Hub. What's the policy, and can you check if it's still under warranty?" \
+  --session-id $SESSION_EVAL --bearer-token "$TOKEN" --stream
+
+/Users/anishkumar/.nvm/versions/node/v24.5.0/bin/agentcore invoke \
+  "What kind of support can you provide? List your capabilities." \
+  --session-id $SESSION_EVAL --bearer-token "$TOKEN" --stream
+```
+
+### 5.5 Run On-Demand Evaluation
+
+```bash
+/Users/anishkumar/.nvm/versions/node/v24.5.0/bin/agentcore run eval \
+  --runtime CustomerSupport \
+  --evaluator Builtin.GoalSuccessRate Builtin.Correctness \
+  --days 1
+```
+
+### 5.6 View Results
+
+```bash
+# Evaluation history
+/Users/anishkumar/.nvm/versions/node/v24.5.0/bin/agentcore evals history \
+  --runtime CustomerSupport --limit 5
+
+# Evaluation logs
+/Users/anishkumar/.nvm/versions/node/v24.5.0/bin/agentcore logs evals \
+  --runtime CustomerSupport --since 30m
+```
+
+CloudWatch: GenAI Observability → Bedrock AgentCore → CustomerSupport → DEFAULT endpoint → evaluation scores
+
+### 5.7 Pause / Resume (Optional)
+
+```bash
+/Users/anishkumar/.nvm/versions/node/v24.5.0/bin/agentcore pause online-eval QualityMonitor
+/Users/anishkumar/.nvm/versions/node/v24.5.0/bin/agentcore resume online-eval QualityMonitor
+```
+
+### Score Interpretation
+
+| Score | Interpretation | Action |
+|-------|---------------|--------|
+| 80–100% | Excellent | Monitor and maintain |
+| 60–80% | Good but improvable | Review low-scoring sessions |
+| < 60% | Needs attention | Investigate root causes |
+
+---
+
+## What Each Lab 5 Command Does
+
+| Command | What it does |
+|---------|-------------|
+| `agentcore add online-eval` | Adds evaluation config to `agentcore.json` |
+| `agentcore run eval --days 1` | Runs on-demand eval against last N days of traces |
+| `agentcore evals history` | Lists past evaluation run results |
+| `agentcore logs evals` | Streams evaluation processing logs |
+| `agentcore pause/resume online-eval` | Toggles continuous evaluation on/off |
+
+---
+
 *Workshop: [AWS Workshop Studio — Getting Started with Amazon Bedrock AgentCore CLI](https://catalog.us-east-1.prod.workshops.aws/)*
