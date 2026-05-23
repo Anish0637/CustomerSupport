@@ -902,4 +902,105 @@ CloudWatch: GenAI Observability → Bedrock AgentCore → CustomerSupport → DE
 
 ---
 
+## Lab 6: Building the Customer Interface
+
+### 6.1 Install Dependencies
+
+```bash
+cd /Users/anishkumar/CustomerSupport/app/CustomerSupport
+uv add flask boto3 requests
+cd ../..
+```
+
+### 6.2 Create Cognito Hosted UI Domain (self-paced)
+
+```bash
+export AWS_PROFILE=anish0637 && export AWS_DEFAULT_REGION=us-east-1
+POOL_ID=us-east-1_5uhOWVywH
+WEB_CLIENT_ID=4hqbuvfji23kgdeqqn2cujs5p4
+
+# Create Cognito hosted UI domain
+aws cognito-idp create-user-pool-domain \
+  --domain customersupport-workshop \
+  --user-pool-id $POOL_ID
+
+# Update web client for authorization code flow
+aws cognito-idp update-user-pool-client \
+  --user-pool-id $POOL_ID \
+  --client-id $WEB_CLIENT_ID \
+  --explicit-auth-flows ALLOW_USER_PASSWORD_AUTH ALLOW_REFRESH_TOKEN_AUTH \
+  --allowed-o-auth-flows code \
+  --allowed-o-auth-scopes openid email profile \
+  --callback-urls '["http://localhost:8501/callback"]' \
+  --logout-urls '["http://localhost:8501/"]' \
+  --supported-identity-providers COGNITO \
+  --allowed-o-auth-flows-user-pool-client
+
+aws ssm put-parameter --name /app/customersupport/agentcore/cognito_domain \
+  --value "https://customersupport-workshop.auth.us-east-1.amazoncognito.com" \
+  --type String --overwrite
+```
+
+Cognito domain: `https://customersupport-workshop.auth.us-east-1.amazoncognito.com`
+
+### 6.3 Frontend File Structure
+
+```
+app/CustomerSupport/frontend/
+  __init__.py
+  frontend.py          # Flask backend (auth + chat proxy)
+  templates/
+    login.html         # Cognito hosted UI redirect page
+    index.html         # Chat interface
+```
+
+### 6.4 How frontend.py Works
+
+- `get_runtime_arn()` reads `agentcore/.cli/deployed-state.json` for auto-discovery
+- `/` → if no session token, redirects to Cognito hosted UI login
+- `/callback` → exchanges authorization code for Cognito access token, stores in Flask session
+- `/chat` → calls AgentCore REST API with `Authorization: Bearer <token>` (not boto3 — JWT bearer not supported)
+- `/logout` → clears session, redirects to Cognito logout endpoint
+- SSE streaming response is parsed and `<thinking>...</thinking>` blocks are stripped before returning JSON to the browser
+
+Key config values:
+- Cognito domain: `https://customersupport-workshop.auth.us-east-1.amazoncognito.com`
+- Web client ID: `4hqbuvfji23kgdeqqn2cujs5p4`
+- Redirect URI: `http://localhost:8501/callback`
+- Invoke URL: `https://bedrock-agentcore.us-east-1.amazonaws.com/runtimes/{arn_encoded}/invocations`
+
+### 6.5 Run the Frontend
+
+```bash
+cd /Users/anishkumar/CustomerSupport/app/CustomerSupport/frontend
+uv run python frontend.py
+```
+
+Open http://localhost:8501 → click "Sign in with Cognito" → login with:
+- Email: `workshopuser@example.com`
+- Password: `WorkshopPass1!`
+
+### 6.6 Test the Interface
+
+Quick action buttons are available, or type custom queries:
+- `Tell me about the Wireless Headphones` — product info tool
+- `What's the return policy for electronics?` — return policy tool
+- `Check warranty for PROD-002` — Gateway → Lambda
+- `Do you remember me?` — cross-session memory recall
+- Click 🔄 New Session → `What's my name?` — verifies session isolation
+
+---
+
+## What Each Lab 6 Component Does
+
+| Component | What it does |
+|-----------|-------------|
+| `frontend.py /callback` | Exchanges Cognito auth code for access token |
+| `frontend.py /chat` | Proxies prompt to AgentCore with user's JWT Bearer token |
+| `login.html` | Redirects to Cognito hosted UI |
+| `index.html` | Chat UI with session management and quick actions |
+| `crypto.randomUUID()` | Generates unique session ID per conversation |
+
+---
+
 *Workshop: [AWS Workshop Studio — Getting Started with Amazon Bedrock AgentCore CLI](https://catalog.us-east-1.prod.workshops.aws/)*
