@@ -1003,4 +1003,187 @@ Quick action buttons are available, or type custom queries:
 
 ---
 
+## Lab 7: Governing Agent Actions with Policies
+
+### 7.0 Prerequisites (self-paced)
+
+**Create and deploy the refund Lambda:**
+
+```bash
+export AWS_PROFILE=anish0637 && export AWS_DEFAULT_REGION=us-east-1
+
+# Create infrastructure/lambda/process_refund/handler.py
+# (simulates refund processing — returns confirmation_id, refunded_amount, status)
+
+cd infrastructure/lambda/process_refund
+zip -j refund.zip handler.py
+aws lambda create-function \
+  --function-name workshop-process-refund \
+  --runtime python3.13 \
+  --handler handler.handler \
+  --role arn:aws:iam::582766763952:role/warranty-check-lambda-role \
+  --zip-file fileb://refund.zip \
+  --timeout 30
+
+REFUND_LAMBDA_ARN=arn:aws:lambda:us-east-1:582766763952:function:workshop-process-refund
+aws ssm put-parameter --name /app/customersupport/agentcore/refund_lambda_arn \
+  --value "$REFUND_LAMBDA_ARN" --type String --overwrite
+aws lambda add-permission \
+  --function-name workshop-process-refund \
+  --statement-id agentcore-gateway-refund \
+  --action lambda:InvokeFunction \
+  --principal bedrock-agentcore.amazonaws.com
+```
+
+### 7.1 Add the Refund Tool Schema
+
+Create `app/CustomerSupport/tool/refund_schema.json`:
+
+```json
+[{
+  "name": "process_refund",
+  "description": "Process a customer refund for a given order.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "order_id": { "type": "string", "description": "The order ID to refund" },
+      "amount":   { "type": "integer", "description": "Refund amount in whole dollars" },
+      "reason":   { "type": "string", "description": "Reason for the refund" }
+    },
+    "required": ["order_id", "amount", "reason"]
+  }
+}]
+```
+
+Note: Use `"type": "integer"` (not `"number"`) — Cedar uses Long for integers, enabling `context.input.amount < 100` comparisons.
+
+### 7.2 Add Refund Target to Gateway + Deploy
+
+```bash
+cd /Users/anishkumar/CustomerSupport
+export AWS_PROFILE=anish0637 && export AWS_DEFAULT_REGION=us-east-1
+
+agentcore add gateway-target \
+  --type lambda-function-arn \
+  --name ProcessRefund \
+  --lambda-arn arn:aws:lambda:us-east-1:582766763952:function:workshop-process-refund \
+  --tool-schema-file app/CustomerSupport/tool/refund_schema.json \
+  --gateway my-gateway-secure
+
+agentcore deploy -y -v
+```
+
+At this point test that unguarded refunds work (any amount succeeds). Then add governance.
+
+### 7.3 Create Policy Engine + Attach to Gateway
+
+```bash
+agentcore add policy-engine \
+  --name CustomerSupportPolicyEngine \
+  --description "Governs customer support agent tool access — refund limits and tool permissions" \
+  --attach-to-gateways my-gateway-secure \
+  --attach-mode ENFORCE
+```
+
+`ENFORCE` mode blocks denied requests. `LOG_ONLY` mode logs decisions without blocking.
+
+**Fix IAM permissions (self-paced only):**
+```bash
+# Gateway role needs CheckAuthorizePermissions — add inline policy
+aws iam put-role-policy \
+  --role-name "AgentCore-CustomerSupport-McpGatewayMyGatewaySecure-O4hRAV5OCj6e" \
+  --policy-name "AllowPolicyEngineCheck" \
+  --policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"bedrock-agentcore:CheckAuthorizePermissions","Resource":"*"}]}'
+```
+
+### 7.4 Get Gateway ARN for Cedar Policies
+
+```bash
+GATEWAY_ID=$(aws bedrock-agentcore-control list-gateways \
+  --query "items[?contains(name, 'my-gateway-secure')].gatewayId | [0]" \
+  --output text)
+
+GATEWAY_ARN=$(aws bedrock-agentcore-control get-gateway \
+  --gateway-identifier $GATEWAY_ID \
+  --query "gatewayArn" --output text)
+
+echo "Gateway ARN: $GATEWAY_ARN"
+```
+
+### 7.5 Create Cedar Policies
+
+**Policy 1: Refund limit (permit < $100)**
+
+```bash
+agentcore add policy \
+  --name refund_limit_policy \
+  --engine CustomerSupportPolicyEngine \
+  --description "Allow refunds under 100 dollars only" \
+  --statement "permit(principal, action == AgentCore::Action::\"ProcessRefund___process_refund\", resource == AgentCore::Gateway::\"${GATEWAY_ARN}\") when { context.input.amount < 100 };"
+```
+
+Cedar syntax: `TargetName___tool_name` (triple underscores). `context.input.amount` maps to the JSON Schema `integer` field.
+
+**Policy 2: Warranty check (always permit for OAuth users)**
+
+Cedar uses **default deny** — once a Policy Engine is attached in ENFORCE mode, every tool needs an explicit `permit`. This policy preserves the existing warranty tool.
+
+```bash
+agentcore add policy \
+  --name warranty_check_policy \
+  --engine CustomerSupportPolicyEngine \
+  --description "Allow all authenticated users to check warranties" \
+  --statement "permit(principal, action == AgentCore::Action::\"WarrantyCheck___check_warranty\", resource == AgentCore::Gateway::\"${GATEWAY_ARN}\") when { (principal is AgentCore::OAuthUser) };" \
+  --validation-mode IGNORE_ALL_FINDINGS
+```
+
+**Deploy:**
+```bash
+agentcore deploy -y -v
+```
+
+### 7.6 Test Policy Enforcement
+
+Login at http://localhost:8501 with `workshopuser@example.com` / `WorkshopPass1!`
+
+| Test | Input | Expected |
+|------|-------|----------|
+| ✅ Small refund | `Refund $50 for ORD-12345, item was defective` | Processed — amount < 100 |
+| ❌ Large refund | `Refund $500 for ORD-67890, full refund` | Blocked — Gateway returns 403 |
+| ✅ Warranty check | `Check warranty for PROD-002` | Works — explicit permit policy |
+
+### 7.7 (Bonus) Generate Policy from Natural Language
+
+```bash
+agentcore add policy \
+  --name refund_reason_policy \
+  --engine CustomerSupportPolicyEngine \
+  --generate "Forbid refunds when the reason does not contain the word defective" \
+  --gateway my-gateway-secure
+
+agentcore deploy -y -v
+```
+
+After deploying:
+
+| Test | Input | Expected |
+|------|-------|----------|
+| ✅ | `Refund $50, item was defective` | Permitted by both policies |
+| ❌ | `Refund $50, I changed my mind` | Blocked — reason lacks "defective" |
+
+The generated Cedar uses `forbid ... unless { reason like "*defective*" }`. `forbid` overrides `permit`, so this takes precedence over the amount policy.
+
+### 7.8 What Each Lab 7 Component Does
+
+| Component | What it does |
+|-----------|-------------|
+| `process_refund` Lambda | Simulates refund processing — returns confirmation ID |
+| `ProcessRefund` gateway target | Exposes Lambda as `ProcessRefund___process_refund` MCP tool |
+| `CustomerSupportPolicyEngine` | Cedar policy container in ENFORCE mode |
+| `refund_limit_policy` | Permits refunds only when `amount < 100` |
+| `warranty_check_policy` | Permits warranty checks for all OAuth users (prevents default-deny regression) |
+| `refund_reason_policy` (bonus) | Forbids refunds unless reason contains "defective" |
+
+---
+
 *Workshop: [AWS Workshop Studio — Getting Started with Amazon Bedrock AgentCore CLI](https://catalog.us-east-1.prod.workshops.aws/)*
