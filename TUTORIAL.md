@@ -554,4 +554,232 @@ The env var `AGENTCORE_GATEWAY_MY_GATEWAY_URL` is injected automatically at runt
 
 ---
 
+## Lab 4: Securing and Observing in Production
+
+### 4.1 Create Cognito User Pool (self-paced — not Workshop Studio event)
+
+```bash
+export AWS_PROFILE=anish0637 && export AWS_DEFAULT_REGION=us-east-1
+
+# User Pool
+POOL_ID=$(aws cognito-idp create-user-pool \
+  --pool-name CustomerSupportUserPool \
+  --auto-verified-attributes email \
+  --username-attributes email \
+  --policies '{"PasswordPolicy":{"MinimumLength":8,"RequireUppercase":true,"RequireLowercase":true,"RequireNumbers":true,"RequireSymbols":false}}' \
+  --query 'UserPool.Id' --output text)
+
+# Resource server
+aws cognito-idp create-resource-server \
+  --user-pool-id $POOL_ID \
+  --identifier "customersupport-api" \
+  --name "CustomerSupportAPI" \
+  --scopes '[{"ScopeName":"invoke","ScopeDescription":"Invoke agent"}]'
+
+# Machine client (client_credentials)
+CLIENT_ID=$(aws cognito-idp create-user-pool-client \
+  --user-pool-id $POOL_ID \
+  --client-name CustomerSupportMachineClient \
+  --generate-secret \
+  --allowed-o-auth-flows client_credentials \
+  --allowed-o-auth-scopes "customersupport-api/invoke" \
+  --allowed-o-auth-flows-user-pool-client \
+  --query 'UserPoolClient.ClientId' --output text)
+
+# Web client (USER_PASSWORD_AUTH)
+WEB_CLIENT_ID=$(aws cognito-idp create-user-pool-client \
+  --user-pool-id $POOL_ID \
+  --client-name CustomerSupportWebClient \
+  --no-generate-secret \
+  --explicit-auth-flows ALLOW_USER_PASSWORD_AUTH ALLOW_REFRESH_TOKEN_AUTH \
+  --query 'UserPoolClient.ClientId' --output text)
+
+DISCOVERY_URL="https://cognito-idp.us-east-1.amazonaws.com/${POOL_ID}/.well-known/openid-configuration"
+
+# Store in SSM
+aws ssm put-parameter --name /app/customersupport/agentcore/pool_id --value $POOL_ID --type String --overwrite
+aws ssm put-parameter --name /app/customersupport/agentcore/client_id --value $CLIENT_ID --type String --overwrite
+aws ssm put-parameter --name /app/customersupport/agentcore/web_client_id --value $WEB_CLIENT_ID --type String --overwrite
+aws ssm put-parameter --name /app/customersupport/agentcore/cognito_discovery_url --value $DISCOVERY_URL --type String --overwrite
+```
+
+Values used in this project:
+- Pool ID: `us-east-1_5uhOWVywH`
+- Client ID (machine): `2g49s2piup5jppvd7tg7jlfhvl`
+- Web Client ID: `4hqbuvfji23kgdeqqn2cujs5p4`
+- Discovery URL: `https://cognito-idp.us-east-1.amazonaws.com/us-east-1_5uhOWVywH/.well-known/openid-configuration`
+
+### 4.2 Retrieve Cognito Config from SSM
+
+```bash
+COGNITO_DISCOVERY_URL=$(aws ssm get-parameter --name /app/customersupport/agentcore/cognito_discovery_url --query 'Parameter.Value' --output text)
+COGNITO_CLIENT_ID=$(aws ssm get-parameter --name /app/customersupport/agentcore/client_id --query 'Parameter.Value' --output text)
+COGNITO_POOL_ID=$(aws ssm get-parameter --name /app/customersupport/agentcore/pool_id --query 'Parameter.Value' --output text)
+COGNITO_WEB_CLIENT_ID=$(aws ssm get-parameter --name /app/customersupport/agentcore/web_client_id --query 'Parameter.Value' --output text)
+```
+
+### 4.3 Update agentcore.json Runtime with JWT Authorizer
+
+In `agentcore/agentcore.json`, add to the `CustomerSupport` runtime entry:
+```json
+"requestHeaderAllowlist": [
+  "X-Amzn-Bedrock-AgentCore-Runtime-Custom-User-Id",
+  "Authorization"
+],
+"authorizerType": "CUSTOM_JWT",
+"authorizerConfiguration": {
+  "customJwtAuthorizer": {
+    "discoveryUrl": "<COGNITO_DISCOVERY_URL>",
+    "allowedClients": ["<CLIENT_ID>", "<WEB_CLIENT_ID>"]
+  }
+}
+```
+
+### 4.4 Recreate Gateway with JWT Auth
+
+Gateway authorizer config can't be updated in-place — must remove and recreate:
+
+```bash
+cd /Users/anishkumar/CustomerSupport
+export AWS_PROFILE=anish0637 && export AWS_DEFAULT_REGION=us-east-1
+
+# Remove old unsecured gateway
+agentcore remove gateway --name my-gateway -y
+
+# Create secured gateway
+agentcore add gateway --name my-gateway-secure \
+  --runtimes CustomerSupport \
+  --authorizer-type CUSTOM_JWT \
+  --discovery-url $COGNITO_DISCOVERY_URL \
+  --allowed-clients $COGNITO_CLIENT_ID,$COGNITO_WEB_CLIENT_ID
+
+# Re-add warranty Lambda target
+WARRANTY_LAMBDA_ARN="arn:aws:lambda:us-east-1:582766763952:function:workshop-warranty-check"
+agentcore add gateway-target \
+  --type lambda-function-arn \
+  --name WarrantyCheck \
+  --lambda-arn $WARRANTY_LAMBDA_ARN \
+  --tool-schema-file app/CustomerSupport/tool/warranty_schema.json \
+  --gateway my-gateway-secure
+```
+
+> The env var injected at runtime changes: `AGENTCORE_GATEWAY_MY_GATEWAY_URL` → `AGENTCORE_GATEWAY_MY_GATEWAY_SECURE_URL`
+
+### 4.5 Code Changes
+
+**`app/CustomerSupport/mcp_client/client.py`** — reads new env var and passes `Authorization` header:
+```python
+def get_gateway_mcp_client(auth_header: str) -> MCPClient | None:
+    url = os.environ.get("AGENTCORE_GATEWAY_MY_GATEWAY_SECURE_URL")
+    if not url:
+        return None
+    return MCPClient(lambda: streamablehttp_client(url=url, headers={"Authorization": auth_header}))
+```
+
+**`app/CustomerSupport/main.py`** — key changes:
+- `import jwt` added
+- `extract_user_id(auth_header)` extracts `username` claim from JWT, falls back to custom header for local dev
+- `get_or_create_agent(session_id, user_id, auth_header)` — gateway MCP client created per-request with auth
+- `invoke()` extracts `Authorization` header and passes to agent factory
+
+**`pyproject.toml`** — added `PyJWT >= 2.0.0`
+
+### 4.6 Validate and Deploy
+
+```bash
+cd /Users/anishkumar/CustomerSupport
+export AWS_PROFILE=anish0637 && export AWS_DEFAULT_REGION=us-east-1
+agentcore validate
+agentcore deploy -y -v
+```
+
+### 4.7 Create Test User and Get Token
+
+```bash
+# Create user
+aws cognito-idp admin-create-user \
+  --user-pool-id $COGNITO_POOL_ID \
+  --username workshopuser@example.com \
+  --temporary-password 'TempPass1!' \
+  --user-attributes Name=email,Value=workshopuser@example.com Name=email_verified,Value=true \
+  --message-action SUPPRESS
+
+aws cognito-idp admin-set-user-password \
+  --user-pool-id $COGNITO_POOL_ID \
+  --username workshopuser@example.com \
+  --password 'WorkshopPass1!' \
+  --permanent
+
+# Get access token
+TOKEN=$(aws cognito-idp initiate-auth \
+  --auth-flow USER_PASSWORD_AUTH \
+  --client-id $COGNITO_WEB_CLIENT_ID \
+  --auth-parameters USERNAME=workshopuser@example.com,PASSWORD='WorkshopPass1!' \
+  --query 'AuthenticationResult.AccessToken' --output text)
+```
+
+### 4.8 Test Authenticated Invocations
+
+```bash
+SESSION_3=$(python3 -c 'import uuid; print(uuid.uuid4())')
+
+# Authenticated — should succeed
+agentcore invoke "What's the return policy for electronics?" \
+  --session-id $SESSION_3 --bearer-token "$TOKEN" --stream
+
+# Unauthenticated — should be rejected
+agentcore invoke "What's the return policy for electronics?" \
+  --session-id $SESSION_3 --stream
+
+# Test Gateway through secured runtime
+SESSION_E=$(python3 -c 'import uuid; print(uuid.uuid4())')
+agentcore invoke "Check the warranty for PROD-001" \
+  --session-id $SESSION_E --bearer-token "$TOKEN" --stream
+
+# Session continuity test
+SESSION_1=$(python3 -c 'import uuid; print(uuid.uuid4())')
+agentcore invoke "My name is Carlos and I just bought a Mechanical Keyboard" \
+  --session-id $SESSION_1 -H "X-Amzn-Bedrock-AgentCore-Runtime-Custom-User-Id: Carlos" --bearer-token "$TOKEN" --stream
+
+agentcore invoke "What did I just buy?" \
+  --session-id $SESSION_1 -H "X-Amzn-Bedrock-AgentCore-Runtime-Custom-User-Id: Carlos" --bearer-token "$TOKEN" --stream
+```
+
+### 4.9 Observability CLI Commands
+
+```bash
+agentcore status
+agentcore traces list --limit 10
+agentcore traces get <trace-id> --output trace.json
+agentcore logs
+agentcore logs --since 1h --level error
+agentcore logs --since 1h --query "warranty"
+```
+
+### Token Refresh (expires after 60 min)
+
+```bash
+TOKEN=$(aws cognito-idp initiate-auth \
+  --auth-flow USER_PASSWORD_AUTH \
+  --client-id $COGNITO_WEB_CLIENT_ID \
+  --auth-parameters USERNAME=workshopuser@example.com,PASSWORD='WorkshopPass1!' \
+  --query 'AuthenticationResult.AccessToken' --output text)
+```
+
+---
+
+## What Each Lab 4 Command Does
+
+| Command | What it does |
+|---------|-------------|
+| `agentcore remove gateway --name X -y` | Removes gateway config from `agentcore.json` |
+| `agentcore add gateway --authorizer-type CUSTOM_JWT ...` | Creates gateway with Cognito JWT auth |
+| `agentcore validate` | Validates `agentcore.json` before deploy |
+| `agentcore status` | Shows all deployed resource statuses |
+| `agentcore traces list` | Lists recent OpenTelemetry traces from CloudWatch |
+| `agentcore logs --since 1h` | Streams recent logs from the runtime |
+| `agentcore invoke --bearer-token` | Invokes runtime with Cognito JWT auth |
+
+---
+
 *Workshop: [AWS Workshop Studio — Getting Started with Amazon Bedrock AgentCore CLI](https://catalog.us-east-1.prod.workshops.aws/)*

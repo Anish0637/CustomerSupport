@@ -3,12 +3,24 @@ from bedrock_agentcore.runtime import BedrockAgentCoreApp
 from model.load import load_model
 from mcp_client.client import get_streamable_http_mcp_client, get_gateway_mcp_client
 from memory.session import get_memory_session_manager
+import jwt
 
 app = BedrockAgentCoreApp()
 log = app.logger
 
-# MCP clients: Exa AI (web search) + AgentCore Gateway (Lambda tools)
-mcp_clients = [get_streamable_http_mcp_client(), get_gateway_mcp_client()]
+SYSTEM_PROMPT = """You are a helpful and professional customer support assistant for an e-commerce company.
+Your role is to:
+- Provide accurate information using the tools available to you
+- Be friendly, patient, and understanding with customers
+- Always offer additional help after answering questions
+- If you can't help with something, direct customers to the appropriate contact
+
+You have access to the following tools:
+1. get_return_policy() - For return policy questions
+2. get_product_info() - To look up product information and specifications
+3. Web search - To search the web for troubleshooting help
+
+Always use the appropriate tool to get accurate, up-to-date information rather than guessing."""
 
 # --- Customer Support Tools ---
 
@@ -69,53 +81,67 @@ def get_product_info(query: str) -> str:
     return f"No products found matching '{query}'."
 
 
-# Define a collection of tools used by the model
-tools = [get_return_policy, get_product_info]
-
-# Add MCP client (Exa AI web search) to tools if available
-for mcp_client in mcp_clients:
-    if mcp_client:
-        tools.append(mcp_client)
-
+# --- Agent Setup ---
 
 _agent = None
 
-SYSTEM_PROMPT = """You are a helpful and professional customer support assistant for an e-commerce company.
-Your role is to:
-- Provide accurate information using the tools available to you
-- Be friendly, patient, and understanding with customers
-- Always offer additional help after answering questions
-- If you can't help with something, direct customers to the appropriate contact
 
-You have access to the following local tools:
-1. get_return_policy() - For return policy questions
-2. get_product_info() - To look up product information and specifications
-
-You have access to tools outside of the local tools through MCP, use them as necessary.
-Always use the appropriate tool to get accurate, up-to-date information rather than guessing."""
-
-
-def get_or_create_agent(session_id: str, user_id: str):
+def get_or_create_agent(session_id: str, user_id: str, auth_header: str):
     global _agent
+
+    session_manager = get_memory_session_manager(session_id, user_id)
+
+    # MCP clients: Exa AI (web search) + AgentCore Gateway (Lambda tools, per-request with auth)
+    mcp_clients = [get_streamable_http_mcp_client(), get_gateway_mcp_client(auth_header)]
+    tools = [get_return_policy, get_product_info]
+    for mcp_client in mcp_clients:
+        if mcp_client:
+            tools.append(mcp_client)
+
     if _agent is None:
         _agent = Agent(
             model=load_model(),
-            session_manager=get_memory_session_manager(session_id, user_id),
+            session_manager=session_manager,
             system_prompt=SYSTEM_PROMPT,
             tools=tools
         )
     return _agent
 
 
+def extract_user_id(auth_header: str) -> str | None:
+    """Extract user_id from JWT bearer token (username claim) or fall back to custom header."""
+    if auth_header and auth_header.startswith("Bearer "):
+        try:
+            token = auth_header.split(" ", 1)[1]
+            claims = jwt.decode(token, options={"verify_signature": False})
+            username = claims.get("username")
+            if username:
+                return username
+        except Exception as e:
+            log.warning(f"Failed to decode JWT for user_id: {e}")
+    else:
+        log.info(f"No Bearer token found. Auth header present: {auth_header is not None}")
+    return None
+
+
 @app.entrypoint
 async def invoke(payload, context):
     log.info("Invoking Agent.....")
 
-    session_id = getattr(context, 'session_id', None) or 'local-session'
-    headers = getattr(context, 'request_headers', None) or {}
-    user_id = headers.get('x-amzn-bedrock-agentcore-runtime-custom-user-id', 'default-user')
+    session_id = context.session_id
+    request_headers = getattr(context, 'request_headers', None) or {}
+    auth_header = request_headers.get('Authorization', '') or request_headers.get('authorization', '')
 
-    agent = get_or_create_agent(session_id, user_id)
+    user_id = extract_user_id(auth_header)
+
+    # Fall back to custom header for local dev
+    if not user_id:
+        user_id = request_headers.get('x-amzn-bedrock-agentcore-runtime-custom-user-id', 'default-user')
+
+    if not session_id:
+        session_id = 'local-session'
+
+    agent = get_or_create_agent(session_id, user_id, auth_header)
     stream = agent.stream_async(payload.get("prompt"))
     async for event in stream:
         if "data" in event and isinstance(event["data"], str):
