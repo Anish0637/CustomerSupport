@@ -393,4 +393,165 @@ Yes! I know a few things about you, Sarah:
 
 ---
 
+---
+
+## Lab 3: AgentCore Gateway
+
+AgentCore Gateway exposes backend tools (Lambda functions) to your agent as MCP tools, so the agent can call them at runtime without embedding the logic locally.
+
+### 3.1 Deploy the Warranty Check Lambda
+
+```bash
+# Create IAM execution role for Lambda
+aws iam create-role \
+  --role-name warranty-check-lambda-role \
+  --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"sts:AssumeRole","Principal":{"Service":"lambda.amazonaws.com"}}]}' \
+  --profile anish0637
+
+aws iam attach-role-policy \
+  --role-name warranty-check-lambda-role \
+  --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole \
+  --profile anish0637
+
+# Package and deploy Lambda
+cd infrastructure/lambda/warranty_check
+zip warranty_lambda.zip handler.py
+
+aws lambda create-function \
+  --function-name workshop-warranty-check \
+  --runtime python3.12 \
+  --role arn:aws:iam::582766763952:role/warranty-check-lambda-role \
+  --handler handler.handler \
+  --zip-file fileb://warranty_lambda.zip \
+  --region us-east-1 \
+  --profile anish0637
+
+cd ../../..
+```
+
+Lambda ARN: `arn:aws:lambda:us-east-1:582766763952:function/workshop-warranty-check`
+
+### 3.2 Add Gateway and Target via CLI
+
+Run from `/Users/anishkumar/CustomerSupport`:
+
+```bash
+export AWS_PROFILE=anish0637
+export AWS_DEFAULT_REGION=us-east-1
+
+WARRANTY_LAMBDA_ARN="arn:aws:lambda:us-east-1:582766763952:function:workshop-warranty-check"
+
+# Add gateway configuration to agentcore.json
+agentcore add gateway --name my-gateway --runtimes CustomerSupport
+
+# Register Lambda as a gateway target with tool schema
+agentcore add gateway-target \
+  --type lambda-function-arn \
+  --name WarrantyCheck \
+  --lambda-arn $WARRANTY_LAMBDA_ARN \
+  --tool-schema-file app/CustomerSupport/tool/warranty_schema.json \
+  --gateway my-gateway
+```
+
+These commands update `agentcore/agentcore.json` with gateway and target config.
+
+### 3.3 Tool Schema
+
+`app/CustomerSupport/tool/warranty_schema.json` defines the `check_warranty` tool exposed to the agent:
+
+```json
+[{
+  "name": "check_warranty",
+  "description": "Check the warranty status of a product by its product ID (e.g. PROD-001).",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "product_id": {"type": "string", "description": "The product ID (e.g. PROD-001)"}
+    },
+    "required": ["product_id"]
+  }
+}]
+```
+
+> `inputSchema` uses `"type": "object"` directly — no nested `"json"` wrapper.
+
+### 3.4 Code Changes
+
+**`app/CustomerSupport/mcp_client/client.py`** — added `get_gateway_mcp_client()`:
+
+```python
+def get_gateway_mcp_client() -> MCPClient | None:
+    url = os.environ.get("AGENTCORE_GATEWAY_MY_GATEWAY_URL")
+    if not url:
+        return None   # graceful local degradation
+    return MCPClient(lambda: streamablehttp_client(url))
+```
+
+**`app/CustomerSupport/main.py`** — key changes:
+- Import `get_gateway_mcp_client` from `mcp_client.client`
+- Add gateway client to `mcp_clients` list
+- Remove `warranty_months` from `PRODUCTS` (now served by Lambda via Gateway)
+- `get_product_info` no longer returns warranty months
+
+### 3.5 Deploy
+
+```bash
+cd /Users/anishkumar/CustomerSupport
+export AWS_PROFILE=anish0637
+export AWS_DEFAULT_REGION=us-east-1
+agentcore deploy -y -v
+```
+
+### 3.6 Test Gateway
+
+```bash
+export AWS_PROFILE=anish0637
+export AWS_DEFAULT_REGION=us-east-1
+cd /Users/anishkumar/CustomerSupport
+
+SESSION_C=$(python3 -c "import uuid; print(uuid.uuid4())")
+
+# Test warranty check via Gateway
+agentcore invoke "Check the warranty for product PROD-003" \
+  --session-id $SESSION_C \
+  -H "X-Amzn-Bedrock-AgentCore-Runtime-Custom-User-Id: Sarah" \
+  --stream
+
+# Combined query
+agentcore invoke "What is the price of PROD-001 and is it still under warranty?" \
+  --session-id $SESSION_C \
+  -H "X-Amzn-Bedrock-AgentCore-Runtime-Custom-User-Id: Sarah" \
+  --stream
+```
+
+### How Lab 3 Works
+
+```
+User prompt
+    ↓
+Agent (Strands)
+    ↓
+AgentCore Gateway MCP URL (env: AGENTCORE_GATEWAY_MY_GATEWAY_URL)
+    ↓
+AgentCore Gateway → invokes Lambda function
+    ↓
+workshop-warranty-check Lambda
+    ↓
+Returns warranty status back to agent
+```
+
+The env var `AGENTCORE_GATEWAY_MY_GATEWAY_URL` is injected automatically at runtime when deployed — not needed locally.
+
+---
+
+## What Each Lab 3 Command Does
+
+| Command | What it does |
+|---------|-------------|
+| `agentcore add gateway` | Adds gateway config to `agentcore.json`, associates with runtime |
+| `agentcore add gateway-target` | Registers Lambda ARN + tool schema as a callable tool |
+| `agentcore deploy -y -v` | Provisions gateway infra and wires env var into runtime container |
+
+---
+
 *Workshop: [AWS Workshop Studio — Getting Started with Amazon Bedrock AgentCore CLI](https://catalog.us-east-1.prod.workshops.aws/)*
