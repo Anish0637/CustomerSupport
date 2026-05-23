@@ -110,11 +110,9 @@ def get_or_create_agent(session_id: str, user_id: str):
 async def invoke(payload, context):
     log.info("Invoking Agent.....")
 
-    session_id = context.session_id
-    user_id = context.request_headers.get('x-amzn-bedrock-agentcore-runtime-custom-user-id', 'default-user')
-
-    if not session_id:
-        raise ValueError("session_id is required.")
+    session_id = getattr(context, 'session_id', None) or 'local-session'
+    headers = getattr(context, 'request_headers', None) or {}
+    user_id = headers.get('x-amzn-bedrock-agentcore-runtime-custom-user-id', 'default-user')
 
     agent = get_or_create_agent(session_id, user_id)
     stream = agent.stream_async(payload.get("prompt"))
