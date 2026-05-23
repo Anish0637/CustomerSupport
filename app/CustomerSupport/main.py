@@ -2,6 +2,7 @@ from strands import Agent, tool
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
 from model.load import load_model
 from mcp_client.client import get_streamable_http_mcp_client
+from memory.session import get_memory_session_manager
 
 app = BedrockAgentCoreApp()
 log = app.logger
@@ -78,12 +79,7 @@ for mcp_client in mcp_clients:
 
 _agent = None
 
-def get_or_create_agent():
-    global _agent
-    if _agent is None:
-        _agent = Agent(
-            model=load_model(),
-            system_prompt="""You are a helpful and professional customer support assistant for an e-commerce company.
+SYSTEM_PROMPT = """You are a helpful and professional customer support assistant for an e-commerce company.
 Your role is to:
 - Provide accurate information using the tools available to you
 - Be friendly, patient, and understanding with customers
@@ -95,7 +91,16 @@ You have access to the following tools:
 2. get_product_info() - To look up product information and specifications
 3. Web search - To search the web for troubleshooting help
 
-Always use the appropriate tool to get accurate, up-to-date information rather than guessing.""",
+Always use the appropriate tool to get accurate, up-to-date information rather than guessing."""
+
+
+def get_or_create_agent(session_id: str, user_id: str):
+    global _agent
+    if _agent is None:
+        _agent = Agent(
+            model=load_model(),
+            session_manager=get_memory_session_manager(session_id, user_id),
+            system_prompt=SYSTEM_PROMPT,
             tools=tools
         )
     return _agent
@@ -105,13 +110,15 @@ Always use the appropriate tool to get accurate, up-to-date information rather t
 async def invoke(payload, context):
     log.info("Invoking Agent.....")
 
-    agent = get_or_create_agent()
+    session_id = context.session_id
+    user_id = context.request_headers.get('x-amzn-bedrock-agentcore-runtime-custom-user-id', 'default-user')
 
-    # Execute and format response
+    if not session_id:
+        raise ValueError("session_id is required.")
+
+    agent = get_or_create_agent(session_id, user_id)
     stream = agent.stream_async(payload.get("prompt"))
-
     async for event in stream:
-        # Handle Text parts of the response
         if "data" in event and isinstance(event["data"], str):
             yield event["data"]
 

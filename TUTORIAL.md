@@ -218,12 +218,178 @@ agentcore destroy
 
 ## Next Steps
 
-- **Lab 2**: Add persistent memory for personalized conversations
+- **Lab 2**: Add persistent memory for personalized conversations ✅ (see below)
 - **Lab 3**: Gateway for centralized, secure tool management
 - **Lab 4**: Production observability and session management
 - **Lab 5**: Continuous quality evaluation
 - **Lab 6**: Customer-facing chat interface
 - **Lab 7**: Governing agent actions with policies
+
+---
+
+---
+
+# Lab 2: Add Memory to Your Agent
+
+**Estimated time: ~20 minutes**
+
+Adds persistent memory so the agent remembers customers across sessions using SEMANTIC (facts) and SUMMARIZATION (conversation history) strategies.
+
+---
+
+## Step 1: Add Memory Resource
+
+```bash
+agentcore add memory \
+  --name SharedMemory \
+  --strategies SEMANTIC,SUMMARIZATION \
+  --expiry 30
+```
+
+Expected output:
+```
+Added memory 'SharedMemory'
+```
+
+This updates `agentcore/agentcore.json` with the memory configuration (SEMANTIC + SUMMARIZATION namespaces).
+
+---
+
+## Step 2: Create the Memory Session Manager
+
+```bash
+mkdir -p app/CustomerSupport/memory
+touch app/CustomerSupport/memory/__init__.py
+touch app/CustomerSupport/memory/session.py
+```
+
+Contents of `app/CustomerSupport/memory/session.py`:
+
+```python
+import os
+from typing import Optional
+from bedrock_agentcore.memory.integrations.strands.config import AgentCoreMemoryConfig, RetrievalConfig
+from bedrock_agentcore.memory.integrations.strands.session_manager import AgentCoreMemorySessionManager
+
+MEMORY_ID = os.getenv("MEMORY_SHAREDMEMORY_ID")
+REGION = os.getenv("AWS_REGION")
+
+def get_memory_session_manager(session_id: str, actor_id: str) -> Optional[AgentCoreMemorySessionManager]:
+    if not MEMORY_ID:
+        return None
+
+    retrieval_config = {
+        f"/users/{actor_id}/facts": RetrievalConfig(top_k=3, relevance_score=0.3),
+        f"/summaries/{actor_id}/{session_id}": RetrievalConfig(top_k=3, relevance_score=0.3)
+    }
+
+    return AgentCoreMemorySessionManager(
+        AgentCoreMemoryConfig(
+            memory_id=MEMORY_ID,
+            session_id=session_id,
+            actor_id=actor_id,
+            retrieval_config=retrieval_config,
+        ),
+        REGION
+    )
+```
+
+---
+
+## Step 3: Update `agentcore.json` — Add Header Allowlist
+
+Add `requestHeaderAllowlist` to the runtime config in `agentcore/agentcore.json`:
+
+```json
+"requestHeaderAllowlist": [
+    "X-Amzn-Bedrock-AgentCore-Runtime-Custom-User-Id"
+]
+```
+
+---
+
+## Step 4: Key Changes in `main.py`
+
+- Import `get_memory_session_manager` from `memory.session`
+- Pass `session_manager` to the `Agent` constructor
+- Extract `session_id` and `user_id` from runtime context in `invoke()`
+
+```python
+from memory.session import get_memory_session_manager
+
+def get_or_create_agent(session_id: str, user_id: str):
+    ...
+    _agent = Agent(
+        model=load_model(),
+        session_manager=get_memory_session_manager(session_id, user_id),
+        ...
+    )
+
+@app.entrypoint
+async def invoke(payload, context):
+    session_id = context.session_id
+    user_id = context.request_headers.get('x-amzn-bedrock-agentcore-runtime-custom-user-id', 'default-user')
+    agent = get_or_create_agent(session_id, user_id)
+    ...
+```
+
+---
+
+## Step 5: Deploy (Memory requires cloud deployment)
+
+```bash
+agentcore deploy -y -v
+```
+
+---
+
+## Step 6: Test Memory Across Sessions
+
+```bash
+# Session A — teach the agent about the user
+SESSION_A=$(python3 -c 'import uuid; print(uuid.uuid4())')
+agentcore invoke "My name is Sarah and I prefer email updates. I recently bought a Smart Watch." \
+  --session-id $SESSION_A \
+  -H "X-Amzn-Bedrock-AgentCore-Runtime-Custom-User-Id: Sarah" --stream
+
+# Wait 1-2 minutes for async memory extraction
+sleep 2m
+
+# Session B — new session, same user — agent should remember
+SESSION_B=$(python3 -c 'import uuid; print(uuid.uuid4())')
+agentcore invoke "Do you know anything about me?" \
+  --session-id $SESSION_B \
+  -H "X-Amzn-Bedrock-AgentCore-Runtime-Custom-User-Id: Sarah" --stream
+```
+
+Expected response from Session B:
+```
+Yes! I know a few things about you, Sarah:
+1. Your name is Sarah
+2. You prefer email updates
+3. You recently purchased a Smart Watch
+```
+
+---
+
+## Memory Strategies
+
+| Strategy | What it captures | Namespace |
+|----------|-----------------|-----------|
+| SEMANTIC | Facts: names, preferences, order details | `/users/{actorId}/facts` |
+| SUMMARIZATION | Compressed conversation history | `/summaries/{actorId}/{sessionId}` |
+
+> Memory extraction is **asynchronous** — wait ~1-2 minutes between sessions.
+
+---
+
+## What Each New Command Does
+
+| Command | What it does |
+|---------|-------------|
+| `agentcore add memory` | Adds memory config to `agentcore.json` |
+| `agentcore deploy -y -v` | Re-deploys updating stack with memory resource |
+| `agentcore invoke ... --session-id ... -H ...` | Invokes with session ID and custom user header |
 
 ---
 
